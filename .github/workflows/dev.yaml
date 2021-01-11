@@ -1,0 +1,160 @@
+name: 'DEV cluster creation workflow'
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'clusters/eks/dev/**/input.yaml'
+      - '!clusters/eks/**/foundation'
+      - '!clusters/eks/**/terraform'
+
+jobs:
+  qamatrix:
+    runs-on: cicd-dev
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+
+    - name: 'checkout code'
+      uses: 'actions/checkout@v2'
+      with:
+        ref: master
+        fetch-depth: 0
+        token: ${{ secrets.BOT_GITHUB_PAT }}
+    
+    - id: set-matrix
+      run: |
+        BASE_JSON="{\"include\":["
+        for i in `git diff-tree --no-commit-id --name-only -r ${{ github.sha }} --diff-filter=A| grep input.yaml | grep "clusters/eks/dev"`;do
+          if [ `echo $i | grep input.yaml` ]
+          then
+            cluster_path=$(dirname $i)
+            cluster_name=$(basename $(dirname $i))
+            cluster_region=$(dirname $i | awk -F '/' '{print $4}')
+            # Add build to the matrix only if it is not already included
+            JSONline="{\"clusterName\":\"$cluster_name\", \"clusterPath\":\"$cluster_path\", \"clusterRegion\":\"$cluster_region\"},"
+            if [[ "$BASE_JSON" != *"$JSONline"* ]]; then
+              BASE_JSON="$BASE_JSON$JSONline"
+            fi
+          fi
+        done
+        # Remove last "," and add closing brackets
+        if [[ $BASE_JSON == *, ]]; then
+          BASE_JSON="${BASE_JSON%?}"
+        fi
+        BASE_JSON="$BASE_JSON]}"
+        echo "$BASE_JSON"
+        # Set output
+        echo "::set-output name=matrix::$( echo "$BASE_JSON" )"
+    
+  create-cluster:
+    needs: qamatrix
+    name: Create ${{ matrix.clusterName }} cluster
+    runs-on: cicd-dev
+    strategy:
+      matrix: ${{fromJson(needs.qamatrix.outputs.matrix)}}
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        ref: master
+        token: ${{ secrets.BOT_GITHUB_PAT }}
+
+    - name: Configure AWS Credentials     # convert to pick dynamic profiles as per input.yaml environment
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        role-skip-session-tagging: true
+        aws-region: ${{ matrix.clusterRegion }}
+        role-to-assume: ${{ secrets.AWS_DEV_ROLE_TO_ASSUME }}
+        role-external-id: ${{ secrets.AWS_DEV_ROLE_EXTERNAL_ID }}
+        role-duration-seconds: 3600
+        role-session-name: InfaDevInfrastructureEKSManagementRole
+
+    # - name: Temp Configure AWS Credentials     # convert to pick dynamic profiles as per input.yaml environment
+    #   uses: aws-actions/configure-aws-credentials@v1
+    #   with:
+    #     aws-region: us-west-2
+    #     aws-access-key-id: ${{ secrets.TEMP_ACCESS_ID }}
+    #     aws-secret-access-key: ${{ secrets.TEMP_SECRET_KEY }}
+    #     aws-session-token: ${{ secrets.TEMP_SESSION_TOKEN }}
+        
+    - name: 'create cluster'
+      run: |
+        git config --global url."https://${{ secrets.BOT_GITHUB_PAT }}:@github.com/".insteadOf "https://github.com/"
+        make create-cluster
+      env:
+        GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_PAT }}
+      working-directory: ${{ matrix.clusterPath }}
+    
+    - name: 'create node groups'
+      run: |
+        make create-nodegroups
+      env:
+        GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_PAT }}
+      working-directory: ${{ matrix.clusterPath }}
+
+    - name: Temporarily disable "include administrators" branch protection
+      uses: benjefferies/branch-protection-bot@master
+      if: always()
+      with:
+        access-token: ${{ secrets.BOT_GITHUB_PAT }}
+        branch: "master"
+        enforce_admins: false
+
+    - name: 'enable flux'
+      run: |
+        echo "sleep 240"
+        sleep 240
+        make bootstrap-flux
+      working-directory: ${{ matrix.clusterPath }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_PAT }}
+        SUMO_ACCESS_KEY: ${{ secrets.SUMO_ACCESS_KEY }}
+        SUMO_ACCESS_ID: ${{ secrets.SUMO_ACCESS_ID }}
+        TPCDEPLOYBOT_PASSWORD: ${{ secrets.TPCDEPLOYBOT_PASSWORD }}
+        HYDRANT_URL: ${{ secrets.HYDRANT_URL }}
+        HYDRANT_ID: ${{ secrets.HYDRANT_ID }}
+        HYDRANT_KEY: ${{ secrets.HYDRANT_KEY }}
+        CTCI_READBOT_TOKEN: ${{ secrets.CTCI_READBOT_TOKEN }}
+        OPSGENIE_KEY: ${{ secrets.OPSGENIE_KEY_QA }}
+        OPSGENIE_HEARTBEAT_KEY: ${{ secrets.OPSGENIE_HEARTBEAT_KEY }}
+
+    - name: 'authorize cluster flux public key'
+      run: |
+        PUBKEY=$(fluxctl identity --k8s-fwd-ns flux)
+        HTTP_CODE=$(curl -s --show-error -o /dev/null -w "%{http_code}" --max-time 10 --retry 3 --retry-delay 5 -X POST https://api.github.com/repos/infacloud/ct-k8-gitops/keys -d '{"title":"${{ matrix.clusterName }}", "key":"'"$PUBKEY"'", "read_only":true}' -H "Content-type: application/json" -H "Authorization: token ${{ secrets.BOT_GITHUB_PAT }}")
+        echo "Got status code as - $HTTP_CODE"
+        if [[ $HTTP_CODE == 201 ]]; then
+          echo "FluxCD deploy key is authorized successfully..."
+        else
+          echo "Unable to authorize FluxCD's deploy key for the cluster ${{ matrix.clusterName }}"
+          exit 1
+        fi
+      working-directory: ${{ matrix.clusterPath }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_PAT }}
+
+    - name: Enable "include administrators" branch protection
+      uses: benjefferies/branch-protection-bot@master
+      if: always()
+      with:
+        access-token: ${{ secrets.BOT_GITHUB_PAT }}
+        branch: "master"
+        enforce_admins: true
+
+    - name: Download Cluster Validator binary
+      uses: Legion2/download-release-action@v2.1.0
+      with:
+        repository: infacloud/ct-k8-gitops
+        tag: '1.0'
+        path: ${{ matrix.clusterPath }}
+        file: post_cluster_validator-linux-amd64
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Prepare validator
+      run: |
+        sudo chown centos:centos post_cluster_validator-linux-amd64
+        sudo chmod +x post_cluster_validator-linux-amd64
+        echo "Wait for 15mins before post validations"
+        sleep 900
+        ./post_cluster_validator-linux-amd64
+      working-directory: ${{ matrix.clusterPath }}
